@@ -24,7 +24,7 @@ function App() {
   const chatContainerRef = useRef(null);
   const textareaRef = useRef(null);
 
-  const API_BASE_URL = 'http://localhost:3001';
+  const API_BASE_URL = 'https://kosma-ai-aggregator-production.up.railway.app';
 
   // Detect mobile device and screen size with debouncing for smooth transitions
   const [windowWidth, setWindowWidth] = useState(window.innerWidth);
