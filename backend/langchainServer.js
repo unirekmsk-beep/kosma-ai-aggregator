@@ -1,15 +1,27 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const LangChainService = require('./services/langchainService');
-const LangChainSynthesisService = require('./services/langchainSynthesisService');
+const OpenAI = require('openai');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize LangChain services
-const langchainService = new LangChainService();
-const synthesisService = new LangChainSynthesisService();
+// Инициализация OpenRouter клиента
+const openrouter = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: "https://openrouter.ai/api/v1",
+});
+
+// Доступные модели через OpenRouter
+const AVAILABLE_MODELS = {
+  openai: 'openai/gpt-3.5-turbo',
+  openai_gpt4: 'openai/gpt-4o',
+  anthropic: 'anthropic/claude-3.5-sonnet',
+  google: 'google/gemini-2.0-flash',
+  meta: 'meta-llama/llama-3.3-70b-instruct',
+  mistral: 'mistralai/mistral-7b-instruct',
+  deepseek: 'deepseek/deepseek-chat'
+};
 
 app.use(cors());
 app.use(express.json());
@@ -17,16 +29,90 @@ app.use(express.json());
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'Backend is healthy', 
-    message: 'AI Aggregator backend with LangChain is running!',
+    message: 'AI Aggregator backend with OpenRouter is running!',
     timestamp: new Date(),
-    services: ['OpenAI', 'Anthropic', 'Google AI'],
-    framework: 'LangChain'
+    services: Object.keys(AVAILABLE_MODELS),
+    framework: 'OpenRouter'
   });
 });
 
-// Enhanced Aggregation Route with LangChain
+// Функция запроса к одной модели через OpenRouter
+async function queryModel(modelId, prompt) {
+  try {
+    const completion = await openrouter.chat.completions.create({
+      model: modelId,
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      max_tokens: 1000,
+      temperature: 0.7,
+    });
+    
+    return completion.choices[0].message.content;
+  } catch (error) {
+    console.error(`Error querying model ${modelId}:`, error.message);
+    return `[Error: ${error.message}]`;
+  }
+}
+
+// Параллельный опрос нескольких моделей
+async function queryMultipleModels(prompt, models) {
+  const results = {};
+  const promises = models.map(async (modelKey) => {
+    const modelId = AVAILABLE_MODELS[modelKey];
+    if (modelId) {
+      const response = await queryModel(modelId, prompt);
+      results[modelKey] = response;
+    } else {
+      results[modelKey] = `[Error: Unknown model ${modelKey}]`;
+    }
+  });
+  
+  await Promise.all(promises);
+  return results;
+}
+
+// Функция синтеза ответов (простая версия, можно заменить на более сложную)
+function synthesizeResponses(prompt, responses) {
+  const validResponses = Object.entries(responses).filter(([_, resp]) => 
+    resp && !resp.includes('[Error:') && !resp.includes('mock')
+  );
+  
+  const confidenceScore = (validResponses.length / Object.keys(responses).length) * 100;
+  let confidence = 'low';
+  if (confidenceScore >= 70) confidence = 'high';
+  else if (confidenceScore >= 30) confidence = 'medium';
+  
+  // Простой синтез: берём первый успешный ответ или собираем summary
+  let synthesizedResponse = '';
+  if (validResponses.length > 0) {
+    synthesizedResponse = validResponses[0][1];
+    if (validResponses.length > 1) {
+      synthesizedResponse += `\n\n[Синтезировано из ${validResponses.length} моделей]`;
+    }
+  } else {
+    synthesizedResponse = 'Не удалось получить ответ от моделей. Пожалуйста, попробуйте позже.';
+  }
+  
+  return {
+    response: synthesizedResponse,
+    confidence: confidence,
+    confidenceScore: confidenceScore,
+    approach: 'openrouter_aggregation',
+    details: {
+      validModels: validResponses.length,
+      totalModels: Object.keys(responses).length,
+      modelsUsed: validResponses.map(([key]) => key)
+    }
+  };
+}
+
+// Основной эндпоинт агрегации
 app.post('/api/aggregate', async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, models = ['openai', 'anthropic', 'google'] } = req.body;
 
   if (!prompt || prompt.trim().length === 0) {
     return res.status(400).json({ error: 'Prompt is required and cannot be empty' });
@@ -37,45 +123,36 @@ app.post('/api/aggregate', async (req, res) => {
   }
 
   try {
-    console.log(`\n=== LangChain Aggregation for prompt ===`);
+    console.log(`\n=== OpenRouter Aggregation for prompt ===`);
     console.log(`Prompt: "${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}"`);
-    console.log(`Prompt length: ${prompt.length} characters`);
+    console.log(`Requested models: ${models.join(', ')}`);
 
     const startTime = Date.now();
 
-    // Query all models using LangChain
-    const modelResponses = await langchainService.queryAllModels(prompt);
+    // Запрос к выбранным моделям
+    const modelResponses = await queryMultipleModels(prompt, models);
     
     const queryTime = Date.now() - startTime;
     console.log(`\n=== Model queries completed in ${queryTime}ms ===`);
 
-    // Log response status
+    // Логируем статусы
     Object.entries(modelResponses).forEach(([model, response]) => {
-      if (response && !response.includes('mock response')) {
+      if (response && !response.includes('[Error:')) {
         console.log(`${model}: SUCCESS - ${response.length} characters`);
       } else {
-        console.log(`${model}: FALLBACK - Using mock response`);
+        console.log(`${model}: FAILED`);
       }
     });
 
-    // Synthesize responses using LangChain
+    // Синтез ответов
     const synthesisStartTime = Date.now();
-    const synthesis = await synthesisService.synthesizeResponses(prompt, modelResponses);
+    const synthesis = synthesizeResponses(prompt, modelResponses);
     const synthesisTime = Date.now() - synthesisStartTime;
 
     console.log(`\n=== Synthesis completed in ${synthesisTime}ms ===`);
     console.log(`Confidence: ${synthesis.confidence} (${synthesis.confidenceScore}%)`);
-    console.log(`Approach: ${synthesis.approach}`);
-    console.log(`Valid models: ${synthesis.details.validModels}`);
 
-    // Format individual responses for client
-    const formattedResponses = {
-      openai: modelResponses.openai || 'No response available',
-      anthropic: modelResponses.anthropic || 'No response available',
-      google: modelResponses.google || 'No response available'
-    };
-
-    // Prepare complete response
+    // Форматируем ответ
     const response = {
       prompt: prompt,
       synthesis: {
@@ -83,20 +160,18 @@ app.post('/api/aggregate', async (req, res) => {
         confidence: synthesis.confidence,
         confidenceScore: synthesis.confidenceScore,
         approach: synthesis.approach,
-        sourcesUsed: Object.keys(modelResponses).filter(key => 
-          modelResponses[key] && !modelResponses[key].includes('mock response')
-        ),
+        sourcesUsed: synthesis.details.modelsUsed,
         details: synthesis.details
       },
-      individualResponses: formattedResponses,
+      individualResponses: modelResponses,
       metadata: {
         processingTimeMs: Date.now() - startTime,
         queryTimeMs: queryTime,
         synthesisTimeMs: synthesisTime,
         timestamp: new Date().toISOString(),
-        totalSources: 3,
+        totalSources: models.length,
         successfulSources: synthesis.details.validModels,
-        framework: 'LangChain'
+        framework: 'OpenRouter'
       }
     };
 
@@ -112,24 +187,28 @@ app.post('/api/aggregate', async (req, res) => {
   }
 });
 
-// LangChain-specific endpoints
+// Эндпоинт для получения списка доступных моделей
 app.get('/api/models', (req, res) => {
   res.json({
-    models: {
-      openai: 'gpt-3.5-turbo',
-      anthropic: 'claude-3-haiku-20240307',
-      google: 'gemini-1.5-flash (with gemini-pro fallback)',
-      synthesis: 'gpt-3.5-turbo'
-    },
-    framework: 'LangChain',
+    models: AVAILABLE_MODELS,
+    default_models: ['openai', 'anthropic', 'google'],
+    framework: 'OpenRouter',
+    documentation: 'https://openrouter.ai/docs',
     features: [
-      'Parallel model execution',
-      'Automatic retries and fallbacks',
-      'Structured output parsing',
-      'Advanced synthesis with AI',
-      'Token usage tracking',
-      'Callback monitoring'
+      '100+ models available',
+      'Automatic retries',
+      'Parallel execution',
+      'Model selection'
     ]
+  });
+});
+
+// Эндпоинт для проверки статуса API ключа
+app.get('/api/key-status', (req, res) => {
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  res.json({
+    openrouter_configured: hasKey,
+    message: hasKey ? 'OpenRouter API key is configured' : 'OpenRouter API key is missing'
   });
 });
 
@@ -145,23 +224,17 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 AI Aggregator Backend with LangChain running on http://localhost:${PORT}`);
+  console.log(`\n🚀 AI Aggregator Backend with OpenRouter running on http://localhost:${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
   console.log(`Aggregation endpoint: POST http://localhost:${PORT}/api/aggregate`);
   console.log(`Model info: GET http://localhost:${PORT}/api/models`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   
-  // Check for API keys
-  const apiKeys = {
-    'OpenAI': !!process.env.OPENAI_API_KEY,
-    'Anthropic': !!process.env.ANTHROPIC_API_KEY,
-    'Google': !!process.env.GOOGLE_AI_API_KEY
-  };
-  
-  console.log('\n📋 API Key Status:');
-  Object.entries(apiKeys).forEach(([service, hasKey]) => {
-    console.log(`  ${service}: ${hasKey ? '✅ Configured' : '❌ Missing (will use fallbacks)'}`);
-  });
-  console.log('\n🔗 Using LangChain for unified AI model management');
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  console.log(`\n📋 OpenRouter API Key: ${hasKey ? '✅ Configured' : '❌ Missing'}`);
+  if (!hasKey) {
+    console.log('⚠️  Please add OPENROUTER_API_KEY to your environment variables');
+  }
+  console.log('\n🔗 Using OpenRouter for unified AI model access');
   console.log('');
 });
