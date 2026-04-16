@@ -12,29 +12,31 @@ const openrouter = new OpenAI({
   baseURL: "https://openrouter.ai/api/v1",
 });
 
-// ===== МОДЕЛИ (бесплатные, актуально на апрель 2026) =====
+// ===== МОДЕЛИ (Актуально на апрель 2026) =====
 const FREE_MODELS = {
-  gemma4_31b: 'google/gemma-4-31b:free',
-  nemotron_super: 'nvidia/nemotron-3-super:free',
+  // Основные (для параллельного опроса)
+  nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',
+  gemma_4_31b: 'google/gemma-4-31b-it:free',
   gpt_oss_120b: 'openai/gpt-oss-120b:free',
-  gemma4_26b: 'google/gemma-4-26b-a4b:free',
-  qwen3_next: 'qwen/qwen3-next-80b-a3b-instruct:free',
+  
+  // Запасные (на случай, если основные перегружены)
   llama_3_3: 'meta-llama/llama-3.3-70b-instruct:free',
-  nemotron_nano: 'nvidia/nemotron-3-nano-30b-a3b:free',
-  gemma_2: 'google/gemma-2-27b-it:free',
-  mistral: 'mistralai/mistral-7b-instruct:free',
+  qwen_3_next: 'qwen/qwen3-next-80b-a3b-instruct:free',
 };
 
-// Модели по умолчанию (можно переопределить через переменную окружения)
-const DEFAULT_MODEL_KEYS = process.env.DEFAULT_MODEL_KEYS 
-  ? process.env.DEFAULT_MODEL_KEYS.split(',')
-  : ['gemma4_31b', 'nemotron_super', 'gpt_oss_120b'];
+// Модели для опроса по умолчанию (топ-3)
+const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gemma_4_31b', 'gpt_oss_120b'];
 
-// Модель для синтеза (фиксированная, быстрая)
-const SYNTHESIS_MODEL = 'google/gemma-4-26b-a4b:free';
+// Модель-синтезатор (отдельная, не участвует в опросе)
+const SYNTHESIS_MODEL = 'meta-llama/llama-3.3-70b-instruct:free';
 
 function getModelId(modelKey) {
-  return FREE_MODELS[modelKey];
+  const modelId = FREE_MODELS[modelKey];
+  if (!modelId) {
+    console.warn(`Unknown model key: ${modelKey}, using fallback`);
+    return FREE_MODELS.llama_3_3; // fallback на запасную
+  }
+  return modelId;
 }
 
 app.use(cors());
@@ -64,28 +66,32 @@ async function queryMultipleModels(prompt, modelIds) {
   const results = {};
   const promises = modelIds.map(async (modelId) => {
     const response = await queryModel(modelId, prompt);
-    const shortName = modelId.split('/').pop().replace(':free', '');
+    const shortName = modelId.split('/').pop().replace(':free', '').substring(0, 30);
     results[shortName] = response;
   });
   await Promise.all(promises);
   return results;
 }
 
-// AI-синтез
+// AI-синтез (отдельной моделью)
 async function aiSynthesize(prompt, responses) {
   const synthesisPrompt = `
 Ты — профессиональный синтезатор ответов ИИ.
 
 Вопрос пользователя: "${prompt}"
 
-Ответы от разных моделей:
+Вот ответы от разных моделей ИИ:
 ${Object.entries(responses).map(([model, response]) => `
 === МОДЕЛЬ: ${model} ===
-${response}
+${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)' : ''}
 `).join('\n')}
 
-Объедини эти ответы в один лучший ответ. Возьми самое ценное из каждого, убери повторы.
-Твой ответ (только сам ответ, без пояснений):
+Твоя задача: объединить эти ответы в один лучший ответ. 
+Возьми самое ценное и точное из каждого ответа. 
+Убери повторы. Если модели противоречат друг другу — выбери наиболее логичный и обоснованный ответ.
+Твой ответ должен быть связным, информативным и полезным.
+
+ТВОЙ СИНТЕЗИРОВАННЫЙ ОТВЕТ (только сам ответ, без пояснений):
 `;
 
   try {
@@ -96,11 +102,14 @@ ${response}
       max_tokens: 1500,
       temperature: 0.5,
     });
-    return completion.choices[0].message.content;
+    const synthesized = completion.choices[0].message.content;
+    console.log(`  Synthesis: SUCCESS (${synthesized.length} chars)`);
+    return synthesized;
   } catch (error) {
     console.error(`  Synthesis error: ${error.message}`);
-    const firstValid = Object.values(responses).find(r => !r.includes('[Error:'));
-    return firstValid || 'Не удалось синтезировать ответ.';
+    // Fallback: берём первый успешный ответ
+    const firstValid = Object.values(responses).find(r => r && !r.includes('[Error:'));
+    return firstValid || 'Не удалось синтезировать ответ. Пожалуйста, попробуйте позже.';
   }
 }
 
@@ -109,9 +118,10 @@ ${response}
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'Backend is healthy',
-    message: 'AI Aggregator with fixed models is running!',
+    message: 'AI Aggregator is running!',
     default_models: DEFAULT_MODEL_KEYS,
     synthesis_model: SYNTHESIS_MODEL,
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -120,6 +130,7 @@ app.get('/api/models', (req, res) => {
     available_models: Object.keys(FREE_MODELS),
     default_models: DEFAULT_MODEL_KEYS,
     synthesis_model: SYNTHESIS_MODEL,
+    fallback_models: ['llama_3_3', 'qwen_3_next']
   });
 });
 
@@ -127,40 +138,65 @@ app.post('/api/aggregate', async (req, res) => {
   const { prompt, models = DEFAULT_MODEL_KEYS } = req.body;
 
   if (!prompt || prompt.trim().length === 0) {
-    return res.status(400).json({ error: 'Prompt is required' });
+    return res.status(400).json({ error: 'Prompt is required and cannot be empty' });
   }
 
-  // Преобразуем ключи моделей в ID
+  if (prompt.length > 2000) {
+    return res.status(400).json({ error: 'Prompt is too long. Maximum 2000 characters allowed.' });
+  }
+
+  // Преобразуем ключи моделей в ID (с автоматическим fallback)
   const modelIds = models.map(key => getModelId(key)).filter(id => id);
   
   if (modelIds.length === 0) {
     return res.status(400).json({ error: 'No valid models specified' });
   }
 
-  console.log(`\n=== Aggregation with ${modelIds.length} models ===`);
-  console.log(`Prompt: "${prompt.substring(0, 100)}..."`);
+  console.log(`\n=== AI Synthesis Aggregation ===`);
+  console.log(`Prompt: "${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}"`);
   console.log(`Models: ${modelIds.join(', ')}`);
 
   const startTime = Date.now();
 
-  // Шаг 1: Опрос моделей
+  // Шаг 1: Параллельный опрос моделей
+  console.log(`\n[Step 1] Querying ${modelIds.length} models in parallel...`);
   const modelResponses = await queryMultipleModels(prompt, modelIds);
   const queryTime = Date.now() - startTime;
+  console.log(`[Step 1] Completed in ${queryTime}ms`);
 
-  // Шаг 2: Синтез
+  // Логируем статусы
+  Object.entries(modelResponses).forEach(([model, response]) => {
+    const status = response && !response.includes('[Error:') ? 'SUCCESS' : 'FAILED';
+    console.log(`  ${model}: ${status}`);
+  });
+
+  // Шаг 2: AI-синтез (отдельной моделью)
+  console.log(`\n[Step 2] AI Synthesis with ${SYNTHESIS_MODEL}...`);
   const synthesisStartTime = Date.now();
   const synthesizedResponse = await aiSynthesize(prompt, modelResponses);
   const synthesisTime = Date.now() - synthesisStartTime;
+  console.log(`[Step 2] Completed in ${synthesisTime}ms`);
 
+  // Шаг 3: Вычисление уверенности
+  const successfulCount = Object.values(modelResponses).filter(r => r && !r.includes('[Error:')).length;
+  const confidenceScore = (successfulCount / modelIds.length) * 100;
+  let confidenceLevel = 'low';
+  if (confidenceScore >= 70) confidenceLevel = 'high';
+  else if (confidenceScore >= 30) confidenceLevel = 'medium';
+  console.log(`\n[Step 3] Confidence: ${confidenceLevel} (${confidenceScore.toFixed(1)}%)`);
+
+  // Формируем ответ
   const response = {
     prompt: prompt,
     synthesis: {
       response: synthesizedResponse,
-      confidence: 'medium',
-      confidenceScore: (Object.keys(modelResponses).length / modelIds.length) * 100,
+      confidence: confidenceLevel,
+      confidenceScore: Math.round(confidenceScore),
       method: 'ai_synthesis',
       synthesisModel: SYNTHESIS_MODEL,
-      sourcesUsed: Object.keys(modelResponses)
+      sourcesUsed: Object.keys(modelResponses).filter(key => 
+        modelResponses[key] && !modelResponses[key].includes('[Error:')
+      )
     },
     individualResponses: modelResponses,
     metadata: {
@@ -169,8 +205,8 @@ app.post('/api/aggregate', async (req, res) => {
       synthesisTimeMs: synthesisTime,
       timestamp: new Date().toISOString(),
       totalSources: modelIds.length,
-      successfulSources: Object.keys(modelResponses).length,
-      framework: 'OpenRouter + Fixed Models',
+      successfulSources: successfulCount,
+      framework: 'OpenRouter + Fixed Models + AI Synthesis',
       free_tier: true
     }
   };
@@ -185,12 +221,25 @@ app.get('/api/key-status', (req, res) => {
     default_models: DEFAULT_MODEL_KEYS,
     synthesis_model: SYNTHESIS_MODEL,
     available_models: Object.keys(FREE_MODELS),
-    message: hasKey ? '✅ API key configured' : '❌ Add OPENROUTER_API_KEY'
+    message: hasKey ? '✅ API key configured. AI Synthesis ready!' : '❌ Add OPENROUTER_API_KEY to Railway Variables'
   });
 });
 
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
 app.listen(PORT, () => {
-  console.log(`\n🚀 Backend running on http://localhost:${PORT}`);
-  console.log(`Default models: ${DEFAULT_MODEL_KEYS.join(', ')}`);
-  console.log(`Synthesis model: ${SYNTHESIS_MODEL}`);
+  console.log(`\n🚀 AI Aggregator with AI Synthesis running on http://localhost:${PORT}`);
+  console.log(`Health check: GET http://localhost:${PORT}/api/health`);
+  console.log(`Aggregation: POST http://localhost:${PORT}/api/aggregate`);
+  console.log(`\n📋 Configuration:`);
+  console.log(`  Default models: ${DEFAULT_MODEL_KEYS.join(', ')}`);
+  console.log(`  Synthesis model: ${SYNTHESIS_MODEL}`);
+  console.log(`  Fallback models: llama_3_3, qwen_3_next`);
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  console.log(`  OpenRouter API Key: ${hasKey ? '✅ Configured' : '❌ Missing'}`);
+  console.log(`\n✨ Features: parallel queries + AI-powered synthesis + confidence scoring + automatic fallback`);
+  console.log('');
 });
