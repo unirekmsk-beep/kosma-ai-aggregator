@@ -14,27 +14,27 @@ const openrouter = new OpenAI({
 
 // ===== МОДЕЛИ (Актуально на апрель 2026) =====
 const FREE_MODELS = {
-  // Основные (для параллельного опроса)
+  // Основные (для параллельного опроса) — все рабочие
   nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',
   gemma_4_31b: 'google/gemma-4-31b-it:free',
   gpt_oss_120b: 'openai/gpt-oss-120b:free',
   
-  // Запасные (на случай, если основные перегружены)
-  llama_3_3: 'meta-llama/llama-3.3-70b-instruct:free',
-  qwen_3_next: 'qwen/qwen3-next-80b-a3b-instruct:free',
+  // Запасные (только стабильные, без Llama)
+  qwen_3_6: 'qwen/qwen3.6-plus-preview:free',
+  gemma_3_27b: 'google/gemma-3-27b-it:free',
 };
 
 // Модели для опроса по умолчанию (топ-3)
 const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gemma_4_31b', 'gpt_oss_120b'];
 
-// Модель-синтезатор (отдельная, не участвует в опросе)
-const SYNTHESIS_MODEL = 'meta-llama/llama-3.3-70b-instruct:free';
+// Модель-синтезатор — используем Qwen 3.6 Plus (стабильная, 1M контекста)
+const SYNTHESIS_MODEL = 'qwen/qwen3.6-plus-preview:free';
 
 function getModelId(modelKey) {
   const modelId = FREE_MODELS[modelKey];
   if (!modelId) {
     console.warn(`Unknown model key: ${modelKey}, using fallback`);
-    return FREE_MODELS.llama_3_3; // fallback на запасную
+    return FREE_MODELS.qwen_3_6; // fallback на стабильную Qwen
   }
   return modelId;
 }
@@ -73,7 +73,7 @@ async function queryMultipleModels(prompt, modelIds) {
   return results;
 }
 
-// AI-синтез (отдельной моделью)
+// AI-синтез с автоматическим fallback (список запасных моделей)
 async function aiSynthesize(prompt, responses) {
   const synthesisPrompt = `
 Ты — профессиональный синтезатор ответов ИИ.
@@ -89,28 +89,37 @@ ${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)'
 Твоя задача: объединить эти ответы в один лучший ответ. 
 Возьми самое ценное и точное из каждого ответа. 
 Убери повторы. Если модели противоречат друг другу — выбери наиболее логичный и обоснованный ответ.
-Твой ответ должен быть связным, информативным и полезным.
 
 ТВОЙ СИНТЕЗИРОВАННЫЙ ОТВЕТ (только сам ответ, без пояснений):
 `;
 
-  try {
-    console.log(`  Synthesizing with ${SYNTHESIS_MODEL}...`);
-    const completion = await openrouter.chat.completions.create({
-      model: SYNTHESIS_MODEL,
-      messages: [{ role: "user", content: synthesisPrompt }],
-      max_tokens: 1500,
-      temperature: 0.5,
-    });
-    const synthesized = completion.choices[0].message.content;
-    console.log(`  Synthesis: SUCCESS (${synthesized.length} chars)`);
-    return synthesized;
-  } catch (error) {
-    console.error(`  Synthesis error: ${error.message}`);
-    // Fallback: берём первый успешный ответ
-    const firstValid = Object.values(responses).find(r => r && !r.includes('[Error:'));
-    return firstValid || 'Не удалось синтезировать ответ. Пожалуйста, попробуйте позже.';
+  // Список моделей для синтеза в порядке приоритета (от самых стабильных)
+  const synthesisModels = [
+    'qwen/qwen3.6-plus-preview:free',           // Новая, 1M контекста, стабильная
+    'google/gemma-3-27b-it:free',                // Надёжная от Google
+    'nvidia/nemotron-3-nano-30b-a3b:free',       // Лёгкая и быстрая от NVIDIA [citation:1]
+    'meta-llama/llama-3.3-70b-instruct:free'     // Мощная, но может быть нагружена
+  ];
+  
+  for (const model of synthesisModels) {
+    try {
+      console.log(`  Synthesizing with ${model}...`);
+      const completion = await openrouter.chat.completions.create({
+        model: model,
+        messages: [{ role: "user", content: synthesisPrompt }],
+        max_tokens: 1500,
+        temperature: 0.5,
+      });
+      console.log(`  Synthesis with ${model}: SUCCESS`);
+      return completion.choices[0].message.content;
+    } catch (error) {
+      console.log(`  ${model} failed: ${error.message}, trying next...`);
+    }
   }
+  
+  // Если все модели упали — берём первый успешный ответ как fallback
+  const firstValid = Object.values(responses).find(r => r && !r.includes('[Error:'));
+  return firstValid || 'Не удалось синтезировать ответ. Пожалуйста, попробуйте позже.';
 }
 
 // ========== ЭНДПОИНТЫ ==========
