@@ -1,256 +1,327 @@
-const { ChatOpenAI } = require('@langchain/openai');
-const { ChatAnthropic } = require('@langchain/anthropic');
-const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
-const { RunnableParallel, RunnablePassthrough } = require('@langchain/core/runnables');
-const { StringOutputParser } = require('@langchain/core/output_parsers');
-const { ChatPromptTemplate } = require('@langchain/core/prompts');
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const OpenAI = require('openai');
 
-class LangChainService {
-  constructor() {
-    this.initializeModels();
-    this.setupChains();
-  }
+const app = express();
+const PORT = process.env.PORT || 3001;
 
-  initializeModels() {
-    // Initialize OpenAI only if API key exists
-    if (process.env.OPENAI_API_KEY) {
-      try {
-        this.openAI = new ChatOpenAI({
-          modelName: 'gpt-3.5-turbo',
-          temperature: 0.7,
-          maxTokens: 400,
-          openAIApiKey: process.env.OPENAI_API_KEY,
-        });
-      } catch (error) {
-        console.warn('Failed to initialize OpenAI:', error.message);
-        this.openAI = null;
-      }
-    } else {
-      console.warn('OpenAI API key not found - will use mock responses');
-      this.openAI = null;
-    }
+// Инициализация OpenRouter клиента
+const openrouter = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: "https://openrouter.ai/api/v1",
+});
 
-    // Initialize Anthropic only if API key exists
-    if (process.env.ANTHROPIC_API_KEY) {
-      try {
-        this.anthropic = new ChatAnthropic({
-          modelName: 'claude-3-haiku-20240307',
-          temperature: 0.7,
-          maxTokens: 400,
-          anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-        });
-      } catch (error) {
-        console.warn('Failed to initialize Anthropic:', error.message);
-        this.anthropic = null;
-      }
-    } else {
-      console.warn('Anthropic API key not found - will use mock responses');
-      this.anthropic = null;
-    }
+// Доступные модели (бесплатные)
+const AVAILABLE_MODELS = {
+  openai_free: 'openai/gpt-oss-20b:free',
+  meta_free: 'meta-llama/llama-3.3-70b-instruct:free',
+  qwen_free: 'qwen/qwen3.6-plus-preview:free',
+  deepseek_free: 'deepseek/deepseek-chat:free',
+  mistral_free: 'mistralai/mistral-7b-instruct:free',
+  gemma_free: 'google/gemma-3-27b-it:free',
+  nvidia_free: 'nvidia/nemotron-3-nano-30b-a3b:free',
+};
 
-    // Initialize Google Gemini only if API key exists
-    if (process.env.GOOGLE_AI_API_KEY) {
-      try {
-        this.googleAI = new ChatGoogleGenerativeAI({
-          model: 'gemini-1.5-flash',
-          temperature: 0.7,
-          maxOutputTokens: 400,
-          apiKey: process.env.GOOGLE_AI_API_KEY,
-        });
+// Модель для синтеза (будет объединять ответы)
+const SYNTHESIS_MODEL = 'openrouter/free'; // автоматически выбирает лучшую бесплатную
 
-        // Fallback model for Google
-        this.googleAIFallback = new ChatGoogleGenerativeAI({
-          model: 'gemini-pro',
-          temperature: 0.7,
-          maxOutputTokens: 400,
-          apiKey: process.env.GOOGLE_AI_API_KEY,
-        });
-      } catch (error) {
-        console.warn('Failed to initialize Google AI:', error.message);
-        this.googleAI = null;
-        this.googleAIFallback = null;
-      }
-    } else {
-      console.warn('Google AI API key not found - will use mock responses');
-      this.googleAI = null;
-      this.googleAIFallback = null;
-    }
-  }
+app.use(cors());
+app.use(express.json());
 
-  setupChains() {
-    // Create a simple prompt template
-    this.promptTemplate = ChatPromptTemplate.fromMessages([
-      ['human', '{input}'],
-    ]);
-
-    // Create individual chains with output parsers only if models exist
-    if (this.openAI) {
-      this.openAIChain = this.promptTemplate
-        .pipe(this.openAI)
-        .pipe(new StringOutputParser());
-    }
-
-    if (this.anthropic) {
-      this.anthropicChain = this.promptTemplate
-        .pipe(this.anthropic)
-        .pipe(new StringOutputParser());
-    }
-
-    if (this.googleAI) {
-      this.googleAIChain = this.promptTemplate
-        .pipe(this.googleAI)
-        .pipe(new StringOutputParser());
-      
-      if (this.googleAIFallback) {
-        this.googleAIChain = this.googleAIChain.withFallbacks({
-          fallbacks: [
-            this.promptTemplate
-              .pipe(this.googleAIFallback)
-              .pipe(new StringOutputParser()),
-          ],
-        });
-      }
-    }
-
-    // Create parallel execution chain only with available models
-    const availableChains = {};
-    if (this.openAIChain) availableChains.openai = this.openAIChain;
-    if (this.anthropicChain) availableChains.anthropic = this.anthropicChain;
-    if (this.googleAIChain) availableChains.google = this.googleAIChain;
-
-    if (Object.keys(availableChains).length > 0) {
-      this.parallelChain = RunnableParallel.from(availableChains);
-    } else {
-      this.parallelChain = null;
-    }
-  }
-
-  async queryAllModels(prompt) {
-    const results = {
-      openai: null,
-      anthropic: null,
-      google: null,
-    };
-
-    try {
-      // Execute all models in parallel with individual error handling
-      if (this.parallelChain) {
-        const parallelResults = await this.parallelChain.invoke(
-          { input: prompt },
-          {
-            // Add callbacks for monitoring
-            callbacks: [
-              {
-                handleLLMStart: async (llm, prompts) => {
-                  console.log(`Starting LLM call: ${llm.name}`);
-                },
-                handleLLMEnd: async (output) => {
-                  console.log('LLM call completed');
-                },
-                handleLLMError: async (err) => {
-                  console.error('LLM error:', err.message);
-                },
-              },
-            ],
-          }
-        );
-
-        // Process results
-        results.openai = parallelResults.openai || null;
-        results.anthropic = parallelResults.anthropic || null;
-        results.google = parallelResults.google || null;
-      } else {
-        // No models available, use individual queries
-        throw new Error('No models available for parallel execution');
-      }
-    } catch (error) {
-      console.error('Parallel execution error:', error);
-      // Try individual calls as fallback
-      results.openai = await this.queryOpenAI(prompt);
-      results.anthropic = await this.queryAnthropic(prompt);
-      results.google = await this.queryGoogle(prompt);
-    }
-
-    return results;
-  }
-
-  async queryOpenAI(prompt) {
-    if (!this.openAIChain) {
-      return this.getMockResponse('openai', 'no_api_key');
-    }
-    try {
-      const response = await this.openAIChain.invoke({ input: prompt });
-      return response;
-    } catch (error) {
-      console.error('OpenAI error:', error.message);
-      if (error.message.includes('insufficient_quota')) {
-        return this.getMockResponse('openai', 'quota_exceeded');
-      }
-      if (error.message.includes('Incorrect API key')) {
-        return this.getMockResponse('openai', 'auth_error');
-      }
-      return this.getMockResponse('openai', 'general_error');
-    }
-  }
-
-  async queryAnthropic(prompt) {
-    if (!this.anthropicChain) {
-      return this.getMockResponse('anthropic', 'no_api_key');
-    }
-    try {
-      const response = await this.anthropicChain.invoke({ input: prompt });
-      return response;
-    } catch (error) {
-      console.error('Anthropic error:', error.message);
-      if (error.message.includes('credit balance')) {
-        return this.getMockResponse('anthropic', 'credit_error');
-      }
-      if (error.message.includes('Invalid API Key')) {
-        return this.getMockResponse('anthropic', 'auth_error');
-      }
-      return this.getMockResponse('anthropic', 'general_error');
-    }
-  }
-
-  async queryGoogle(prompt) {
-    if (!this.googleAIChain) {
-      return this.getMockResponse('google', 'no_api_key');
-    }
-    try {
-      const response = await this.googleAIChain.invoke({ input: prompt });
-      return response;
-    } catch (error) {
-      console.error('Google AI error:', error.message);
-      if (error.message.includes('API key not valid')) {
-        return this.getMockResponse('google', 'auth_error');
-      }
-      return this.getMockResponse('google', 'general_error');
-    }
-  }
-
-  getMockResponse(service, errorType) {
-    const mockResponses = {
-      openai: {
-        no_api_key: 'OpenAI API key not configured. This is a mock response. To use real OpenAI responses, please add your API key to the .env file.',
-        quota_exceeded: 'OpenAI API quota exceeded. This is a mock response. The service would normally provide insights based on GPT-3.5-turbo\'s analysis.',
-        auth_error: 'OpenAI authentication failed. This is a mock response simulating GPT-3.5-turbo\'s typical analytical style.',
-        general_error: 'OpenAI service temporarily unavailable. This mock response represents what GPT-3.5-turbo might say.',
-      },
-      anthropic: {
-        no_api_key: 'Anthropic API key not configured. This is a mock response. To use real Claude responses, please add your API key to the .env file.',
-        credit_error: 'Anthropic API credit limit reached. This is a mock response. Claude would typically provide a thoughtful, nuanced perspective here.',
-        auth_error: 'Anthropic authentication failed. This mock response simulates Claude\'s characteristic thoroughness and clarity.',
-        general_error: 'Anthropic service temporarily unavailable. This represents Claude\'s typical structured approach.',
-      },
-      google: {
-        no_api_key: 'Google AI API key not configured. This is a mock response. To use real Gemini responses, please add your API key to the .env file.',
-        auth_error: 'Google AI authentication failed. This is a mock response. Gemini would normally offer comprehensive analysis here.',
-        general_error: 'Google AI service temporarily unavailable. This mock response represents Gemini\'s typical informative style.',
-      },
-    };
-
-    return mockResponses[service]?.[errorType] || `${service} service error - mock response provided.`;
+// Функция запроса к одной модели
+async function queryModel(modelId, prompt) {
+  try {
+    console.log(`  Querying ${modelId}...`);
+    const completion = await openrouter.chat.completions.create({
+      model: modelId,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1000,
+      temperature: 0.7,
+    });
+    const content = completion.choices[0].message.content;
+    console.log(`  ${modelId}: SUCCESS (${content.length} chars)`);
+    return content;
+  } catch (error) {
+    console.error(`  ${modelId}: ERROR - ${error.message}`);
+    return `[Error: ${error.message}]`;
   }
 }
 
-module.exports = LangChainService;
+// Параллельный опрос нескольких моделей
+async function queryMultipleModels(prompt, models) {
+  const results = {};
+  const modelIds = models.map(key => AVAILABLE_MODELS[key]).filter(id => id);
+  
+  const promises = modelIds.map(async (modelId) => {
+    const response = await queryModel(modelId, prompt);
+    // Находим ключ по значению модели
+    const modelKey = Object.keys(AVAILABLE_MODELS).find(key => AVAILABLE_MODELS[key] === modelId);
+    results[modelKey] = response;
+  });
+  
+  await Promise.all(promises);
+  return results;
+}
+
+// AI-синтез: объединение ответов нескольких моделей
+async function aiSynthesize(prompt, responses) {
+  // Формируем промпт для синтезатора
+  const synthesisPrompt = `
+Ты — профессиональный синтезатор ответов ИИ. Твоя задача — объединить ответы от нескольких моделей в один лучший ответ.
+
+Вопрос пользователя: "${prompt}"
+
+Вот ответы от разных моделей:
+
+${Object.entries(responses).map(([model, response]) => `
+=== МОДЕЛЬ: ${model} ===
+${response}
+`).join('\n')}
+
+Правила синтеза:
+1. Возьми самое ценное и точное из каждого ответа
+2. Если модели противоречат друг другу — выбери наиболее логичный и обоснованный ответ
+3. Сохрани важные детали, убрав повторы
+4. Ответ должен быть связным, информативным и полезным
+5. Если все ответы ошибочные или пустые — напиши, что не удалось получить ответ
+
+Твой синтезированный ответ (только сам ответ, без пояснений):
+`;
+
+  try {
+    console.log(`  Synthesizing responses with ${SYNTHESIS_MODEL}...`);
+    const completion = await openrouter.chat.completions.create({
+      model: SYNTHESIS_MODEL,
+      messages: [{ role: "user", content: synthesisPrompt }],
+      max_tokens: 1500,
+      temperature: 0.5,
+    });
+    const synthesized = completion.choices[0].message.content;
+    console.log(`  Synthesis: SUCCESS (${synthesized.length} chars)`);
+    return synthesized;
+  } catch (error) {
+    console.error(`  Synthesis: ERROR - ${error.message}`);
+    // Fallback: берём первый успешный ответ
+    const firstValid = Object.values(responses).find(r => !r.includes('[Error:'));
+    return firstValid || 'Не удалось синтезировать ответ. Пожалуйста, попробуйте позже.';
+  }
+}
+
+// Простой синтез (fallback, если AI-синтез не сработал)
+function simpleSynthesize(prompt, responses) {
+  const validResponses = Object.entries(responses).filter(([_, resp]) => 
+    resp && !resp.includes('[Error:')
+  );
+  
+  if (validResponses.length === 0) {
+    return 'Не удалось получить ответ от моделей. Пожалуйста, попробуйте позже.';
+  }
+  
+  const bestResponse = validResponses[0][1];
+  if (validResponses.length > 1) {
+    return `${bestResponse}\n\n[Синтезировано из ${validResponses.length} моделей]`;
+  }
+  return bestResponse;
+}
+
+// Вычисление уверенности
+function calculateConfidence(responses) {
+  const validCount = Object.values(responses).filter(r => r && !r.includes('[Error:')).length;
+  const totalCount = Object.keys(responses).length;
+  const score = (validCount / totalCount) * 100;
+  
+  let level = 'low';
+  if (score >= 70) level = 'high';
+  else if (score >= 30) level = 'medium';
+  
+  return { score, level };
+}
+
+// ========== ЭНДПОИНТЫ ==========
+
+app.get('/api/health', (req, res) => {
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  res.json({ 
+    status: 'Backend is healthy', 
+    message: 'AI Aggregator with AI Synthesis is running!',
+    timestamp: new Date(),
+    free_tier_enabled: hasKey,
+    synthesis_model: SYNTHESIS_MODEL,
+    framework: 'OpenRouter + AI Synthesis'
+  });
+});
+
+// Получение списка моделей
+app.get('/api/models', (req, res) => {
+  res.json({
+    available_models: Object.keys(AVAILABLE_MODELS).map(key => ({
+      id: key,
+      model: AVAILABLE_MODELS[key],
+      is_free: true
+    })),
+    default_models: ['openai_free', 'meta_free', 'qwen_free'],
+    synthesis_model: SYNTHESIS_MODEL,
+    features: ['AI-powered synthesis', 'Parallel queries', 'Free tier']
+  });
+});
+
+// Основной эндпоинт агрегации с AI-синтезом
+app.post('/api/aggregate', async (req, res) => {
+  const { 
+    prompt, 
+    models = ['openai_free', 'meta_free', 'qwen_free']
+  } = req.body;
+
+  if (!prompt || prompt.trim().length === 0) {
+    return res.status(400).json({ error: 'Prompt is required and cannot be empty' });
+  }
+
+  if (prompt.length > 2000) {
+    return res.status(400).json({ error: 'Prompt is too long. Maximum 2000 characters allowed.' });
+  }
+
+  try {
+    console.log(`\n=== AI Synthesis Aggregation ===`);
+    console.log(`Prompt: "${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}"`);
+    console.log(`Models: ${models.join(', ')}`);
+
+    const startTime = Date.now();
+
+    // Шаг 1: Параллельный опрос моделей
+    console.log(`\n[Step 1] Querying ${models.length} models in parallel...`);
+    const modelResponses = await queryMultipleModels(prompt, models);
+    
+    const queryTime = Date.now() - startTime;
+    console.log(`\n[Step 1] Completed in ${queryTime}ms`);
+
+    // Логируем статусы
+    Object.entries(modelResponses).forEach(([model, response]) => {
+      const status = response && !response.includes('[Error:') ? 'SUCCESS' : 'FAILED';
+      console.log(`  ${model}: ${status}`);
+    });
+
+    // Шаг 2: AI-синтез (объединение ответов)
+    console.log(`\n[Step 2] AI Synthesis with ${SYNTHESIS_MODEL}...`);
+    const synthesisStartTime = Date.now();
+    
+    let synthesizedResponse;
+    let synthesisMethod;
+    
+    try {
+      synthesizedResponse = await aiSynthesize(prompt, modelResponses);
+      synthesisMethod = 'ai_synthesis';
+    } catch (synthesisError) {
+      console.log(`  AI Synthesis failed, falling back to simple synthesis...`);
+      synthesizedResponse = simpleSynthesize(prompt, modelResponses);
+      synthesisMethod = 'simple_synthesis_fallback';
+    }
+    
+    const synthesisTime = Date.now() - synthesisStartTime;
+    console.log(`[Step 2] Completed in ${synthesisTime}ms (method: ${synthesisMethod})`);
+
+    // Шаг 3: Вычисление уверенности
+    const confidence = calculateConfidence(modelResponses);
+    console.log(`\n[Step 3] Confidence: ${confidence.level} (${confidence.score}%)`);
+
+    // Формируем ответ
+    const response = {
+      prompt: prompt,
+      synthesis: {
+        response: synthesizedResponse,
+        confidence: confidence.level,
+        confidenceScore: confidence.score,
+        method: synthesisMethod,
+        synthesisModel: SYNTHESIS_MODEL,
+        sourcesUsed: Object.keys(modelResponses).filter(key => 
+          modelResponses[key] && !modelResponses[key].includes('[Error:')
+        )
+      },
+      individualResponses: modelResponses,
+      metadata: {
+        processingTimeMs: Date.now() - startTime,
+        queryTimeMs: queryTime,
+        synthesisTimeMs: synthesisTime,
+        timestamp: new Date().toISOString(),
+        totalSources: models.length,
+        successfulSources: confidence.score / (100 / models.length),
+        framework: 'OpenRouter + AI Synthesis',
+        free_tier: true
+      }
+    };
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('\n=== Error in /api/aggregate ===');
+    console.error(error);
+    res.status(500).json({ 
+      error: 'Failed to aggregate responses.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Тестовый эндпоинт для проверки AI-синтеза
+app.get('/api/test-synthesis', async (req, res) => {
+  const testPrompt = req.query.prompt || "What are the benefits of artificial intelligence?";
+  
+  try {
+    // Тестовые ответы для проверки синтеза
+    const testResponses = {
+      openai_free: "AI helps automate repetitive tasks, freeing humans for creative work.",
+      meta_free: "Key benefits include improved efficiency, data analysis at scale, and 24/7 availability.",
+      qwen_free: "Artificial intelligence enhances decision-making, reduces errors, and enables new discoveries."
+    };
+    
+    const synthesized = await aiSynthesize(testPrompt, testResponses);
+    res.json({
+      success: true,
+      test_prompt: testPrompt,
+      test_responses: testResponses,
+      synthesized_response: synthesized,
+      message: "AI Synthesis is working! You can now use /api/aggregate with real queries."
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: error.message,
+      help: "Check your OPENROUTER_API_KEY in Railway Variables"
+    });
+  }
+});
+
+// Эндпоинт для проверки статуса API ключа
+app.get('/api/key-status', (req, res) => {
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  res.json({
+    openrouter_configured: hasKey,
+    synthesis_model: SYNTHESIS_MODEL,
+    available_models: Object.keys(AVAILABLE_MODELS),
+    features: ['parallel_queries', 'ai_synthesis', 'confidence_scoring'],
+    message: hasKey ? '✅ API key configured. AI Synthesis ready!' : '❌ Add OPENROUTER_API_KEY to Railway Variables'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🚀 AI Aggregator with AI Synthesis running on http://localhost:${PORT}`);
+  console.log(`Health check: GET http://localhost:${PORT}/api/health`);
+  console.log(`Test synthesis: GET http://localhost:${PORT}/api/test-synthesis`);
+  console.log(`Aggregation: POST http://localhost:${PORT}/api/aggregate`);
+  
+  const hasKey = !!process.env.OPENROUTER_API_KEY;
+  console.log(`\n📋 OpenRouter API Key: ${hasKey ? '✅ Configured' : '❌ Missing'}`);
+  if (hasKey) {
+    console.log(`🎯 AI Synthesis Model: ${SYNTHESIS_MODEL}`);
+    console.log(`📋 Default models: openai_free, meta_free, qwen_free`);
+    console.log(`✨ Features: parallel queries + AI-powered synthesis + confidence scoring`);
+  } else {
+    console.log('⚠️  Please add OPENROUTER_API_KEY to your Railway Variables');
+  }
+  console.log('');
+});
