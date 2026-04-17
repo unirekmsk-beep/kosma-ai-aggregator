@@ -12,23 +12,22 @@ const openrouter = new OpenAI({
   baseURL: "https://openrouter.ai/api/v1",
 });
 
-// ===== МОДЕЛИ (Актуально на апрель 2026) =====
+// ===== ТОЛЬКО СТАБИЛЬНЫЕ МОДЕЛИ (апрель 2026) =====
 const FREE_MODELS = {
-  // Основные (для параллельного опроса) — все рабочие
-  nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',
-  gemma_4_31b: 'google/gemma-4-31b-it:free',
-  gpt_oss_120b: 'openai/gpt-oss-120b:free',
+  // Три разные модели для параллельного опроса
+  nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',   // мощная от NVIDIA
+  gpt_oss_120b: 'openai/gpt-oss-120b:free',                  // от OpenAI
+  gemma_3_27b: 'google/gemma-3-27b-it:free',                 // от Google (рабочая, проверена)
   
-  // Запасные (только стабильные, без Llama)
-  qwen_3_6: 'qwen/qwen3.6-plus-preview:free',
-  gemma_3_27b: 'google/gemma-3-27b-it:free',
+  // Запасная (только для fallback, если основные падают)
+  nemotron_nano: 'nvidia/nemotron-3-nano-30b-a3b:free',
 };
 
-// Модели для опроса по умолчанию (топ-3)
-const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gemma_4_31b', 'gpt_oss_120b'];
+// Модели для опроса по умолчанию (3 разные)
+const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gpt_oss_120b', 'gemma_3_27b'];
 
-// Модель-синтезатор — используем Qwen 3.6 Plus (стабильная, 1M контекста)
-const SYNTHESIS_MODEL = 'qwen/qwen3.6-plus-preview:free';
+// Модель-синтезатор — отдельная, не участвует в опросе
+const SYNTHESIS_MODEL = 'nvidia/nemotron-3-nano-30b-a3b:free';
 
 function getModelId(modelKey) {
   const modelId = FREE_MODELS[modelKey];
