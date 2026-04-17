@@ -38,8 +38,14 @@ const FREE_MODELS = {
 // Модели для опроса по умолчанию (ТОП-3)
 const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gpt_oss_120b', 'gemma_4_31b'];
 
-// Модель-синтезатор (отдельная, лёгкая и быстрая)
-const SYNTHESIS_MODEL = 'nvidia/nemotron-3-nano-30b-a3b:free';
+// Резервные модели для опроса (на случай, если основные упали)
+const FALLBACK_MODELS_FOR_QUERY = [
+  'nvidia/nemotron-3-nano-30b-a3b:free',   // лёгкая, стабильная
+  'google/gemma-3-27b-it:free',            // средняя
+  'qwen/qwen3-next-80b-a3b-instruct:free', // мощная запасная
+  'z-ai/glm-4.5-air:free',                // от Z.ai
+  'minimax/minimax-m2.5:free',            // новая
+];
 
 // Список всех ID моделей для синтеза (в порядке приоритета)
 const SYNTHESIS_MODELS_LIST = [
@@ -83,15 +89,50 @@ async function queryModel(modelId, prompt) {
   }
 }
 
-// Параллельный опрос нескольких моделей
-async function queryMultipleModels(prompt, modelIds) {
+// Параллельный опрос моделей с автоматической заменой упавших
+async function queryMultipleModelsWithFallback(prompt, modelIds, fallbackModelIds) {
   const results = {};
-  const promises = modelIds.map(async (modelId) => {
+  const workingModelIds = [];
+  
+  // Шаг 1: Пробуем запросить все основные модели
+  console.log(`  Attempting to query ${modelIds.length} primary models...`);
+  const initialPromises = modelIds.map(async (modelId) => {
     const response = await queryModel(modelId, prompt);
-    const shortName = modelId.split('/').pop().replace(':free', '').substring(0, 30);
+    const shortName = modelId.split('/').pop().replace(':free', '').substring(0, 35);
     results[shortName] = response;
+    if (response && !response.includes('[Error:')) {
+      workingModelIds.push(modelId);
+    }
+    return { modelId, response };
   });
-  await Promise.all(promises);
+  
+  await Promise.all(initialPromises);
+  console.log(`  Primary working models: ${workingModelIds.length}/${modelIds.length}`);
+  
+  // Шаг 2: Если рабочих моделей меньше 3, добираем из резервного списка
+  const neededCount = 3 - workingModelIds.length;
+  if (neededCount > 0 && fallbackModelIds.length > 0) {
+    console.log(`  Need ${neededCount} more model(s), trying fallbacks...`);
+    
+    const fallbackPromises = [];
+    for (let i = 0; i < Math.min(neededCount, fallbackModelIds.length); i++) {
+      const fallbackId = fallbackModelIds[i % fallbackModelIds.length];
+      fallbackPromises.push(
+        queryModel(fallbackId, prompt).then(response => {
+          const shortName = `fallback_${fallbackId.split('/').pop().replace(':free', '').substring(0, 30)}`;
+          results[shortName] = response;
+          if (response && !response.includes('[Error:')) {
+            workingModelIds.push(fallbackId);
+            console.log(`  Fallback ${fallbackId} added successfully`);
+          }
+          return response;
+        })
+      );
+    }
+    await Promise.all(fallbackPromises);
+  }
+  
+  console.log(`  Final working models count: ${workingModelIds.length}`);
   return results;
 }
 
@@ -122,10 +163,10 @@ ${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)'
       const completion = await openrouter.chat.completions.create({
         model: model,
         messages: [{ role: "user", content: synthesisPrompt }],
-        max_tokens: 3500,
+        max_tokens: 3500,  // ← УВЕЛИЧЕНО с 1500 до 3500
         temperature: 0.5,
       });
-      console.log(`  Synthesis with ${model}: SUCCESS`);
+      console.log(`  Synthesis with ${model}: SUCCESS (${completion.choices[0].message.content.length} chars)`);
       return completion.choices[0].message.content;
     } catch (error) {
       console.log(`  ${model} failed: ${error.message}, trying next...`);
@@ -144,7 +185,7 @@ app.get('/api/health', (req, res) => {
     status: 'Backend is healthy',
     message: 'AI Aggregator is running!',
     default_models: DEFAULT_MODEL_KEYS,
-    synthesis_model: SYNTHESIS_MODEL,
+    fallback_enabled: true,
     timestamp: new Date().toISOString()
   });
 });
@@ -153,7 +194,7 @@ app.get('/api/models', (req, res) => {
   res.json({
     available_models: Object.keys(FREE_MODELS),
     default_models: DEFAULT_MODEL_KEYS,
-    synthesis_model: SYNTHESIS_MODEL,
+    fallback_models_for_query: FALLBACK_MODELS_FOR_QUERY,
     synthesis_fallback_list: SYNTHESIS_MODELS_LIST
   });
 });
@@ -178,32 +219,30 @@ app.post('/api/aggregate', async (req, res) => {
 
   console.log(`\n=== AI Synthesis Aggregation ===`);
   console.log(`Prompt: "${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}"`);
-  console.log(`Models: ${modelIds.join(', ')}`);
+  console.log(`Primary models: ${modelIds.join(', ')}`);
+  console.log(`Fallback pool: ${FALLBACK_MODELS_FOR_QUERY.length} models available`);
 
   const startTime = Date.now();
 
-  // Шаг 1: Параллельный опрос моделей
-  console.log(`\n[Step 1] Querying ${modelIds.length} models in parallel...`);
-  const modelResponses = await queryMultipleModels(prompt, modelIds);
+  // Шаг 1: Параллельный опрос моделей (с автоматической заменой упавших)
+  console.log(`\n[Step 1] Querying models with fallback support...`);
+  const modelResponses = await queryMultipleModelsWithFallback(prompt, modelIds, FALLBACK_MODELS_FOR_QUERY);
   const queryTime = Date.now() - startTime;
   console.log(`[Step 1] Completed in ${queryTime}ms`);
 
   // Логируем статусы
-  Object.entries(modelResponses).forEach(([model, response]) => {
-    const status = response && !response.includes('[Error:') ? 'SUCCESS' : 'FAILED';
-    console.log(`  ${model}: ${status}`);
-  });
+  const successfulCount = Object.values(modelResponses).filter(r => r && !r.includes('[Error:')).length;
+  console.log(`  Successful responses: ${successfulCount}/${Object.keys(modelResponses).length}`);
 
   // Шаг 2: AI-синтез (с автоматическим перебором моделей)
-  console.log(`\n[Step 2] AI Synthesis (trying fallback models)...`);
+  console.log(`\n[Step 2] AI Synthesis (trying fallback models, max_tokens=3500)...`);
   const synthesisStartTime = Date.now();
   const synthesizedResponse = await aiSynthesize(prompt, modelResponses);
   const synthesisTime = Date.now() - synthesisStartTime;
   console.log(`[Step 2] Completed in ${synthesisTime}ms`);
 
   // Шаг 3: Вычисление уверенности
-  const successfulCount = Object.values(modelResponses).filter(r => r && !r.includes('[Error:')).length;
-  const confidenceScore = (successfulCount / modelIds.length) * 100;
+  const confidenceScore = (successfulCount / 3) * 100;  // всегда стремимся к 3 моделям
   let confidenceLevel = 'low';
   if (confidenceScore >= 70) confidenceLevel = 'high';
   else if (confidenceScore >= 30) confidenceLevel = 'medium';
@@ -228,10 +267,11 @@ app.post('/api/aggregate', async (req, res) => {
       queryTimeMs: queryTime,
       synthesisTimeMs: synthesisTime,
       timestamp: new Date().toISOString(),
-      totalSources: modelIds.length,
+      totalSources: 3,
       successfulSources: successfulCount,
       framework: 'OpenRouter + Multi-Tier Fallback',
-      free_tier: true
+      free_tier: true,
+      max_tokens_synthesis: 3500
     }
   };
 
@@ -243,9 +283,10 @@ app.get('/api/key-status', (req, res) => {
   res.json({
     openrouter_configured: hasKey,
     default_models: DEFAULT_MODEL_KEYS,
-    synthesis_model: SYNTHESIS_MODEL,
+    fallback_models_count: FALLBACK_MODELS_FOR_QUERY.length,
+    synthesis_models_count: SYNTHESIS_MODELS_LIST.length,
     available_models: Object.keys(FREE_MODELS),
-    message: hasKey ? '✅ API key configured. AI Synthesis ready!' : '❌ Add OPENROUTER_API_KEY to Railway Variables'
+    message: hasKey ? '✅ API key configured. Multi-tier fallback ready!' : '❌ Add OPENROUTER_API_KEY to Railway Variables'
   });
 });
 
@@ -260,8 +301,10 @@ app.listen(PORT, () => {
   console.log(`Aggregation: POST http://localhost:${PORT}/api/aggregate`);
   console.log(`\n📋 Configuration:`);
   console.log(`  Default models: ${DEFAULT_MODEL_KEYS.join(', ')}`);
-  console.log(`  Synthesis fallback count: ${SYNTHESIS_MODELS_LIST.length} models`);
+  console.log(`  Fallback query models: ${FALLBACK_MODELS_FOR_QUERY.length}`);
+  console.log(`  Synthesis fallback models: ${SYNTHESIS_MODELS_LIST.length}`);
+  console.log(`  Synthesis max_tokens: 3500`);
   console.log(`  OpenRouter API Key: ${process.env.OPENROUTER_API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`\n✨ Features: parallel queries + multi-tier AI synthesis + confidence scoring`);
+  console.log(`\n✨ Features: parallel queries + auto-fallback + multi-tier synthesis + confidence scoring`);
   console.log('');
 });
