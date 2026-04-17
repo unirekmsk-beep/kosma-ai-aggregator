@@ -122,7 +122,7 @@ ${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)'
       const completion = await openrouter.chat.completions.create({
         model: model,
         messages: [{ role: "user", content: synthesisPrompt }],
-        max_tokens: 1500,
+        max_tokens: 3500,
         temperature: 0.5,
       });
       console.log(`  Synthesis with ${model}: SUCCESS`);
