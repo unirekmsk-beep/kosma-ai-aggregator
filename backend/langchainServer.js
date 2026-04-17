@@ -12,28 +12,51 @@ const openrouter = new OpenAI({
   baseURL: "https://openrouter.ai/api/v1",
 });
 
-// ===== ТОЛЬКО СТАБИЛЬНЫЕ МОДЕЛИ (апрель 2026) =====
+// ===== ПОЛНЫЙ СПИСОК БЕСПЛАТНЫХ МОДЕЛЕЙ (апрель 2026) =====
 const FREE_MODELS = {
-  // Три разные модели для параллельного опроса
-  nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',   // мощная от NVIDIA
-  gpt_oss_120b: 'openai/gpt-oss-120b:free',                  // от OpenAI
-  gemma_3_27b: 'google/gemma-3-27b-it:free',                 // от Google (рабочая, проверена)
+  // ОСНОВНЫЕ (ТОП-3) — самые мощные и стабильные
+  nemotron_super: 'nvidia/nemotron-3-super-120b-a12b:free',
+  gpt_oss_120b: 'openai/gpt-oss-120b:free',
+  gemma_4_31b: 'google/gemma-4-31b-it:free',
   
-  // Запасная (только для fallback, если основные падают)
+  // РЕЗЕРВНЫЕ (1-я линия) — тоже мощные, на случай перегрузки основных
+  qwen_next: 'qwen/qwen3-next-80b-a3b-instruct:free',
+  glm_4_5: 'z-ai/glm-4.5-air:free',
+  minimax: 'minimax/minimax-m2.5:free',
+  hermes: 'nousresearch/hermes-3-llama-3.1-405b:free',
+  
+  // ЛЁГКИЕ (2-я линия) — для синтеза и быстрых ответов
   nemotron_nano: 'nvidia/nemotron-3-nano-30b-a3b:free',
+  gemma_3_27b: 'google/gemma-3-27b-it:free',
+  gemma_3_12b: 'google/gemma-3-12b-it:free',
+  
+  // САМЫЕ ЛЁГКИЕ (последний рубеж)
+  gemma_3_4b: 'google/gemma-3-4b-it:free',
+  llama_3_2: 'meta-llama/llama-3.2-3b-instruct:free',
 };
 
-// Модели для опроса по умолчанию (3 разные)
-const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gpt_oss_120b', 'gemma_3_27b'];
+// Модели для опроса по умолчанию (ТОП-3)
+const DEFAULT_MODEL_KEYS = ['nemotron_super', 'gpt_oss_120b', 'gemma_4_31b'];
 
-// Модель-синтезатор — отдельная, не участвует в опросе
+// Модель-синтезатор (отдельная, лёгкая и быстрая)
 const SYNTHESIS_MODEL = 'nvidia/nemotron-3-nano-30b-a3b:free';
+
+// Список всех ID моделей для синтеза (в порядке приоритета)
+const SYNTHESIS_MODELS_LIST = [
+  'nvidia/nemotron-3-nano-30b-a3b:free',
+  'google/gemma-3-27b-it:free',
+  'google/gemma-3-12b-it:free',
+  'z-ai/glm-4.5-air:free',
+  'minimax/minimax-m2.5:free',
+  'google/gemma-3-4b-it:free',
+  'meta-llama/llama-3.2-3b-instruct:free',
+];
 
 function getModelId(modelKey) {
   const modelId = FREE_MODELS[modelKey];
   if (!modelId) {
-    console.warn(`Unknown model key: ${modelKey}, using fallback`);
-    return FREE_MODELS.qwen_3_6; // fallback на стабильную Qwen
+    console.warn(`Unknown model key: ${modelKey}, using fallback to nemotron_nano`);
+    return FREE_MODELS.nemotron_nano;
   }
   return modelId;
 }
@@ -72,7 +95,7 @@ async function queryMultipleModels(prompt, modelIds) {
   return results;
 }
 
-// AI-синтез с автоматическим fallback (список запасных моделей)
+// AI-синтез с автоматическим перебором моделей
 async function aiSynthesize(prompt, responses) {
   const synthesisPrompt = `
 Ты — профессиональный синтезатор ответов ИИ.
@@ -92,15 +115,8 @@ ${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)'
 ТВОЙ СИНТЕЗИРОВАННЫЙ ОТВЕТ (только сам ответ, без пояснений):
 `;
 
-  // Список моделей для синтеза в порядке приоритета (от самых стабильных)
-  const synthesisModels = [
-    'qwen/qwen3.6-plus-preview:free',           // Новая, 1M контекста, стабильная
-    'google/gemma-3-27b-it:free',                // Надёжная от Google
-    'nvidia/nemotron-3-nano-30b-a3b:free',       // Лёгкая и быстрая от NVIDIA [citation:1]
-    'meta-llama/llama-3.3-70b-instruct:free'     // Мощная, но может быть нагружена
-  ];
-  
-  for (const model of synthesisModels) {
+  // Перебираем все модели из списка SYNTHESIS_MODELS_LIST
+  for (const model of SYNTHESIS_MODELS_LIST) {
     try {
       console.log(`  Synthesizing with ${model}...`);
       const completion = await openrouter.chat.completions.create({
@@ -116,7 +132,7 @@ ${response.substring(0, 1500)}${response.length > 1500 ? '...(обрезано)'
     }
   }
   
-  // Если все модели упали — берём первый успешный ответ как fallback
+  // Если все модели упали — берём первый успешный ответ
   const firstValid = Object.values(responses).find(r => r && !r.includes('[Error:'));
   return firstValid || 'Не удалось синтезировать ответ. Пожалуйста, попробуйте позже.';
 }
@@ -138,7 +154,7 @@ app.get('/api/models', (req, res) => {
     available_models: Object.keys(FREE_MODELS),
     default_models: DEFAULT_MODEL_KEYS,
     synthesis_model: SYNTHESIS_MODEL,
-    fallback_models: ['llama_3_3', 'qwen_3_next']
+    synthesis_fallback_list: SYNTHESIS_MODELS_LIST
   });
 });
 
@@ -178,8 +194,8 @@ app.post('/api/aggregate', async (req, res) => {
     console.log(`  ${model}: ${status}`);
   });
 
-  // Шаг 2: AI-синтез (отдельной моделью)
-  console.log(`\n[Step 2] AI Synthesis with ${SYNTHESIS_MODEL}...`);
+  // Шаг 2: AI-синтез (с автоматическим перебором моделей)
+  console.log(`\n[Step 2] AI Synthesis (trying fallback models)...`);
   const synthesisStartTime = Date.now();
   const synthesizedResponse = await aiSynthesize(prompt, modelResponses);
   const synthesisTime = Date.now() - synthesisStartTime;
@@ -201,7 +217,7 @@ app.post('/api/aggregate', async (req, res) => {
       confidence: confidenceLevel,
       confidenceScore: Math.round(confidenceScore),
       method: 'ai_synthesis',
-      synthesisModel: SYNTHESIS_MODEL,
+      synthesisModel: 'auto_fallback',
       sourcesUsed: Object.keys(modelResponses).filter(key => 
         modelResponses[key] && !modelResponses[key].includes('[Error:')
       )
@@ -214,7 +230,7 @@ app.post('/api/aggregate', async (req, res) => {
       timestamp: new Date().toISOString(),
       totalSources: modelIds.length,
       successfulSources: successfulCount,
-      framework: 'OpenRouter + Fixed Models + AI Synthesis',
+      framework: 'OpenRouter + Multi-Tier Fallback',
       free_tier: true
     }
   };
@@ -239,15 +255,13 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 AI Aggregator with AI Synthesis running on http://localhost:${PORT}`);
+  console.log(`\n🚀 AI Aggregator with Multi-Tier Fallback running on http://localhost:${PORT}`);
   console.log(`Health check: GET http://localhost:${PORT}/api/health`);
   console.log(`Aggregation: POST http://localhost:${PORT}/api/aggregate`);
   console.log(`\n📋 Configuration:`);
   console.log(`  Default models: ${DEFAULT_MODEL_KEYS.join(', ')}`);
-  console.log(`  Synthesis model: ${SYNTHESIS_MODEL}`);
-  console.log(`  Fallback models: llama_3_3, qwen_3_next`);
-  const hasKey = !!process.env.OPENROUTER_API_KEY;
-  console.log(`  OpenRouter API Key: ${hasKey ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`\n✨ Features: parallel queries + AI-powered synthesis + confidence scoring + automatic fallback`);
+  console.log(`  Synthesis fallback count: ${SYNTHESIS_MODELS_LIST.length} models`);
+  console.log(`  OpenRouter API Key: ${process.env.OPENROUTER_API_KEY ? '✅ Configured' : '❌ Missing'}`);
+  console.log(`\n✨ Features: parallel queries + multi-tier AI synthesis + confidence scoring`);
   console.log('');
 });
